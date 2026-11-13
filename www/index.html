@@ -287,7 +287,7 @@ textarea.desc{width:100%;border:2px solid var(--line);border-radius:16px;padding
       <div class="f"><label>Clave de API de Gemini</label>
         <div class="keybox"><input id="s_key" type="password" autocomplete="off" placeholder="Pega aquí tu clave (AIza…)"><button class="pill" onclick="toggleKey()">👁</button></div></div>
       <div class="meta" style="margin-top:0;font-size:13px">Se crea gratis en <a class="link" href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a>. Queda guardada solo en este celular.</div>
-      <div class="f" style="margin-top:10px"><label>Modelo</label><input id="s_model" type="text" autocomplete="off"></div>
+      <div class="f" style="margin-top:10px"><label>Modelo (déjalo en "auto")</label><input id="s_model" type="text" autocomplete="off" placeholder="auto"></div>
       <button class="ghost" onclick="testKey()">Probar conexión</button>
       <div id="keyTest"></div>
     </div>
@@ -354,7 +354,7 @@ textarea.desc{width:100%;border:2px solid var(--line);border-radius:16px;padding
         <textarea class="backup" id="restoreTxt" placeholder="Pega aquí el texto de tu copia"></textarea>
         <button class="primary" onclick="restoreBackup()">Restaurar (reemplaza lo actual)</button>
       </div>
-      <div class="meta" style="font-size:12px">Chigüi v1.0</div>
+      <div class="meta" style="font-size:12px">Chigüi v1.1</div>
     </div>
   </div>
 </section>
@@ -417,9 +417,9 @@ const DEFAULTS = {
   goal:'bajar', diet:'baja en carbohidratos', startW:92, goalW:80,
   kcal:2691, carbs:61, fat:209, protein:141, fiber:30,
   steps:11000, burn:841, water:2500, glass:250, pet:'Chigüi', notes:'', name:'',
-  model:'gemini-2.5-flash'
+  model:'auto'
 };
-const FALLBACK_MODELS=['gemini-2.5-flash','gemini-flash-latest','gemini-2.5-flash-lite'];
+const FALLBACK_MODELS=['gemini-3.8-flash','gemini-3.7-flash','gemini-3.6-flash','gemini-3.5-flash','gemini-flash-latest','gemini-3.5-flash-lite'];
 const EXERCISES = [
   ['caminar','Caminar',3.5],['caminar_rapido','Caminata rápida',4.8],['correr','Correr / trotar',9],
   ['bici','Bicicleta',7.5],['pesas','Gimnasio / pesas',5],['funcional','Funcional / HIIT',8],
@@ -468,6 +468,7 @@ function getKey(){try{return localStorage.getItem('chigui:apikey')||''}catch(e){
 function setKey(v){try{v?localStorage.setItem('chigui:apikey',v):localStorage.removeItem('chigui:apikey')}catch(e){}}
 function loadAll(){
   const st=LS.get('settings'); if(st) S={...DEFAULTS,...st};
+  if(!S.model||/^gemini-(1|2)\./.test(S.model)) S.model='auto';
   LS.dayKeys().forEach(k=>{const d=LS.get(k);if(d&&d.date)days[d.date]={...newDay(d.date),...d}});
   try{navigator.storage&&navigator.storage.persist&&navigator.storage.persist()}catch(e){}
   return !!st;
@@ -475,13 +476,37 @@ function loadAll(){
 
 /* ================== GEMINI ================== */
 function blobToB64(blob){return new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(String(r.result).split(',')[1]);r.onerror=rej;r.readAsDataURL(blob)})}
+// Elige el modelo: el que el usuario escribió, el último que funcionó, o los "flash" vigentes que la clave puede usar.
+let listedModels=null;
+async function listFlashModels(key){
+  if(listedModels) return listedModels;
+  try{
+    const r=await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=200',{headers:{'x-goog-api-key':key}});
+    if(!r.ok) return [];
+    const j=await r.json();
+    const ver=n=>{const m=n.match(/gemini-(\d+)(?:\.(\d+))?/);return m?(+m[1])*100+(+(m[2]||0)):0};
+    listedModels=(j.models||[])
+      .filter(m=>(m.supportedGenerationMethods||[]).includes('generateContent'))
+      .map(m=>String(m.name||'').replace(/^models\//,''))
+      .filter(n=>/^gemini-.*flash/.test(n)&&!/image|tts|live|audio|embedding|preview|exp|thinking|banana/.test(n))
+      .sort((a,b)=>(/lite/.test(a)-/lite/.test(b))||ver(b)-ver(a));
+    return listedModels;
+  }catch(e){return []}
+}
+async function candidateModels(key){
+  const user=(S.model&&S.model!=='auto'&&!/^gemini-(1|2)\./.test(S.model))?[S.model]:[];
+  let last='';try{last=localStorage.getItem('chigui:workingModel')||''}catch(e){}
+  const listed=await listFlashModels(key);
+  const all=[...user,last,...listed.slice(0,4),...FALLBACK_MODELS].filter(Boolean);
+  return [...new Set(all)].slice(0,8);
+}
 async function callGemini(prompt,blob){
   const key=getKey();
   if(!key) throw {friendly:'Primero pon tu clave de Gemini en Metas → Inteligencia artificial.',goSettings:true};
   const parts=[{text:prompt}];
   if(blob) parts.push({inline_data:{mime_type:'image/jpeg',data:await blobToB64(blob)}});
   const body=JSON.stringify({contents:[{role:'user',parts}],generationConfig:{responseMimeType:'application/json',temperature:0.2}});
-  const models=[S.model,...FALLBACK_MODELS.filter(m=>m!==S.model)].filter(Boolean);
+  let models=await candidateModels(key);
   let lastErr=null;
   for(const model of models){
     let r;
@@ -492,11 +517,12 @@ async function callGemini(prompt,blob){
     if(r.ok){
       const txt=(j.candidates&&j.candidates[0]&&j.candidates[0].content&&j.candidates[0].content.parts||[]).map(p=>p.text||'').join('');
       if(!txt) throw {friendly:'La IA no devolvió respuesta (puede que la foto haya sido bloqueada). Intenta con otra foto.'};
-      if(model!==S.model){S.model=model;saveSettingsDoc()}
+      try{localStorage.setItem('chigui:workingModel',model)}catch(e){}
       return txt;
     }
     const msg=(j.error&&j.error.message)||'';
-    if(r.status===404){lastErr={friendly:'Modelo no disponible: '+model};continue}
+    if(r.status===404||(r.status===400&&/not (found|supported)|no longer/i.test(msg))){lastErr={friendly:'Ningún modelo de Gemini respondió. Prueba escribiendo otro nombre de modelo en Metas.'};try{if(localStorage.getItem('chigui:workingModel')===model)localStorage.removeItem('chigui:workingModel')}catch(e){};continue}
+    if(r.status===401) throw {friendly:'Google rechazó la clave ('+(msg.slice(0,90)||'no autorizada')+'). Crea una clave nueva en AI Studio y pégala otra vez.',goSettings:true};
     if(r.status===400&&/api key/i.test(msg)) throw {friendly:'La clave de Gemini no es válida. Revísala en Metas.',goSettings:true};
     if(r.status===403) throw {friendly:'La clave no tiene permiso para usar Gemini. Crea una nueva en aistudio.google.com.',goSettings:true};
     if(r.status===429) throw {friendly:'Llegaste al límite gratis de Gemini por ahora. Espera un rato (el límite diario se reinicia cada día).'};
@@ -968,7 +994,7 @@ async function testKey(){
   const v=$('s_key').value.trim(); if(!v){$('keyTest').innerHTML='<div class="err">Pega primero tu clave.</div>';return}
   setKey(v); const m=$('s_model').value.trim(); if(m)S.model=m;
   $('keyTest').innerHTML='<div class="loading" style="padding:10px 0"><div class="spin"></div></div>';
-  try{await callGemini('Responde solo con este JSON: {"ok":true}',null);$('keyTest').innerHTML='<div class="tip">✅ ¡Funciona! Ya puedes analizar fotos.</div>';saveSettingsDoc()}
+  try{await callGemini('Responde solo con este JSON: {"ok":true}',null);let wm='';try{wm=localStorage.getItem('chigui:workingModel')||''}catch(e){}$('keyTest').innerHTML=`<div class="tip">✅ ¡Funciona! Ya puedes analizar fotos.${wm?' (modelo: '+esc(wm)+')':''}</div>`;saveSettingsDoc()}
   catch(e){$('keyTest').innerHTML=`<div class="err">${esc(e&&e.friendly||'No funcionó')}</div>`}
 }
 function calcGoals(){
