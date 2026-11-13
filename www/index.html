@@ -354,7 +354,7 @@ textarea.desc{width:100%;border:2px solid var(--line);border-radius:16px;padding
         <textarea class="backup" id="restoreTxt" placeholder="Pega aquí el texto de tu copia"></textarea>
         <button class="primary" onclick="restoreBackup()">Restaurar (reemplaza lo actual)</button>
       </div>
-      <div class="meta" style="font-size:12px">Chigüi v1.1</div>
+      <div class="meta" style="font-size:12px">Chigüi v1.2</div>
     </div>
   </div>
 </section>
@@ -389,7 +389,7 @@ textarea.desc{width:100%;border:2px solid var(--line);border-radius:16px;padding
     <div id="foodErr"></div>
     <button class="primary" id="analyzeBtn" onclick="analyze()">Analizar con Claude</button>
   </div>
-  <div id="foodLoading" class="loading hidden"><div class="spin"></div><div id="loadingTxt">Analizando tu comida…</div></div>
+  <div id="foodLoading" class="loading hidden"><div class="spin"></div><div id="loadingTxt">Analizando tu comida…</div><div id="loadingSecs" style="font-size:13px"></div><button class="ghost" style="max-width:220px" onclick="cancelAnalyze()">Cancelar</button></div>
   <div id="foodResult" class="hidden"></div>
 </div>
 
@@ -481,7 +481,8 @@ let listedModels=null;
 async function listFlashModels(key){
   if(listedModels) return listedModels;
   try{
-    const r=await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=200',{headers:{'x-goog-api-key':key}});
+    const ctl=new AbortController();const t=setTimeout(()=>ctl.abort(),8000);
+    const r=await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=200',{headers:{'x-goog-api-key':key},signal:ctl.signal});clearTimeout(t);
     if(!r.ok) return [];
     const j=await r.json();
     const ver=n=>{const m=n.match(/gemini-(\d+)(?:\.(\d+))?/);return m?(+m[1])*100+(+(m[2]||0)):0};
@@ -500,20 +501,35 @@ async function candidateModels(key){
   const all=[...user,last,...listed.slice(0,4),...FALLBACK_MODELS].filter(Boolean);
   return [...new Set(all)].slice(0,8);
 }
-async function callGemini(prompt,blob){
+async function callGemini(prompt,blob,signal){
   const key=getKey();
   if(!key) throw {friendly:'Primero pon tu clave de Gemini en Metas → Inteligencia artificial.',goSettings:true};
   const parts=[{text:prompt}];
   if(blob) parts.push({inline_data:{mime_type:'image/jpeg',data:await blobToB64(blob)}});
-  const body=JSON.stringify({contents:[{role:'user',parts}],generationConfig:{responseMimeType:'application/json',temperature:0.2}});
+  const mkBody=fast=>JSON.stringify({contents:[{role:'user',parts}],generationConfig:Object.assign({responseMimeType:'application/json',temperature:0.2},fast?{thinkingConfig:{thinkingLevel:'low'}}:{})});
+  const started=Date.now();
   let models=await candidateModels(key);
   let lastErr=null;
   for(const model of models){
-    let r;
-    try{
-      r=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,{method:'POST',headers:{'Content-Type':'application/json','x-goog-api-key':key},body});
-    }catch(e){throw {friendly:'Sin conexión a internet. Revisa tus datos o wifi.'}}
-    let j={};try{j=await r.json()}catch(e){}
+    let r,j={},fast=true;
+    for(let attempt=0;attempt<2;attempt++){
+      if(Date.now()-started>90000) throw {friendly:'Gemini está tardando demasiado. Intenta de nuevo en un momento.'};
+      const ctl=new AbortController();
+      const onCancel=()=>ctl.abort('cancel');
+      if(signal){if(signal.aborted)throw {friendly:'Cancelado.',cancelled:true};signal.addEventListener('abort',onCancel,{once:true})}
+      const t=setTimeout(()=>ctl.abort('timeout'),45000);
+      try{
+        r=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,{method:'POST',headers:{'Content-Type':'application/json','x-goog-api-key':key},body:mkBody(fast),signal:ctl.signal});
+        j={};try{j=await r.json()}catch(e){}
+      }catch(e){
+        if(signal&&signal.aborted) throw {friendly:'Cancelado.',cancelled:true};
+        if(ctl.signal.aborted) throw {friendly:'Gemini tardó más de 45 segundos en responder. Revisa tu conexión e intenta de nuevo.'};
+        throw {friendly:'Sin conexión a internet. Revisa tus datos o wifi.'};
+      }finally{clearTimeout(t);if(signal)signal.removeEventListener('abort',onCancel)}
+      const m0=(j.error&&j.error.message)||'';
+      if(fast&&r.status===400&&/thinking/i.test(m0)){fast=false;continue}  // modelo sin ese ajuste: reintenta normal
+      break;
+    }
     if(r.ok){
       const txt=(j.candidates&&j.candidates[0]&&j.candidates[0].content&&j.candidates[0].content.parts||[]).map(p=>p.text||'').join('');
       if(!txt) throw {friendly:'La IA no devolvió respuesta (puede que la foto haya sido bloqueada). Intenta con otra foto.'};
@@ -811,7 +827,7 @@ function openDay(k){viewKey=k;renderHoy();go('hoy')}
 /* ================== SHEETS ================== */
 let openSheetId=null;
 function openSheet(id){closeSheet();openSheetId=id;$('scrim').classList.add('on');$(id).classList.add('on')}
-function closeSheet(){if(openSheetId)$(openSheetId).classList.remove('on');$('scrim').classList.remove('on');openSheetId=null}
+function closeSheet(){cancelAnalyze();if(openSheetId)$(openSheetId).classList.remove('on');$('scrim').classList.remove('on');openSheetId=null}
 
 /* ---------- FOOD ---------- */
 function openFoodSheet(){
@@ -882,19 +898,26 @@ async function analyze(){
   if(!getKey()){$('foodErr').innerHTML='<div class="err">Primero pon tu clave de Gemini en <b>Metas</b>. <button class="link" onclick="closeSheet();go(\'ajustes\')">Ir ahora</button></div>';return}
   $('foodStep1').classList.add('hidden');$('foodLoading').classList.remove('hidden');
   $('loadingTxt').textContent=pending.blob?'Mirando tu plato…':'Calculando…';
+  const t0=Date.now();$('loadingSecs').textContent='';
+  clearInterval(analyze._tick);analyze._tick=setInterval(()=>{$('loadingSecs').textContent=Math.round((Date.now()-t0)/1000)+' s'},1000);
+  analyze._ctl=new AbortController();
   try{
-    const txt=await callGemini(buildPrompt(desc,!!pending.blob),pending.blob);
+    const txt=await callGemini(buildPrompt(desc,!!pending.blob),pending.blob,analyze._ctl.signal);
     let res=parseJSON(txt);
     if(Array.isArray(res))res=res[0]||{};
     if(res.es_comida===false){throw {friendly:res.razon||'No parece comida. Intenta con otra foto.'}}
+    clearInterval(analyze._tick);
     pending.result=normalize(res);pending.mult=1;
     renderResult();
   }catch(e){
     $('foodLoading').classList.add('hidden');$('foodStep1').classList.remove('hidden');
+    clearInterval(analyze._tick);
+    if(e&&e.cancelled){$('foodErr').innerHTML='';return}
     const msg=e&&e.friendly?e.friendly:'No pude analizar la comida. Intenta de nuevo o agrega una descripción.';
     $('foodErr').innerHTML=`<div class="err">${esc(msg)}${e&&e.goSettings?' <button class="link" onclick="closeSheet();go(\'ajustes\')">Ir a Metas</button>':''}</div>`;
   }
 }
+function cancelAnalyze(){try{analyze._ctl&&analyze._ctl.abort()}catch(e){}}
 function normalize(r){
   const n=v=>Math.max(0,Number(v)||0);
   const v=['bien','moderado','evitar'].includes(r.veredicto)?r.veredicto:'moderado';
