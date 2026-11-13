@@ -1,0 +1,8 @@
+{
+  "appId": "com.martin.chigui",
+  "appName": "Chigüi",
+  "webDir": "www",
+  "android": {
+    "backgroundColor": "#4CAA5E"
+  }
+}
